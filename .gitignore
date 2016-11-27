@@ -1,2 +1,6 @@
-#virtualenv environment
+# virtualenv environment
 .env/*
+__pycache__/*
+
+# compiled files
+**/*.pyc
