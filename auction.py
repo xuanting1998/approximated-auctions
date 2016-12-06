@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import linprog
+from pyscipopt import Model, quicksum
 import itertools as it
 import time
 
@@ -18,61 +18,13 @@ class CostFn(object):
         self.capacity = capacity
 
     def eval(self, values):
-        return self.fn(values)
+        return np.vectorize(lambda x: self.fn(x) if x > 0 else 0)(values)
 
     def get_capacity(self):
         return self.capacity
 
     def get_coef(self):
         return self.fn.coef
-
-# Used in nonlinear optimization over polytope
-class Vertex(object):
-    @staticmethod
-    def is_valid(binding_constraints, constraints):
-        A, b = Vertex.separate_constraints(constraints)
-        return np.linalg.matrix_rank(A[binding_constraints,]) == A.shape[1]
-
-    @staticmethod
-    def separate_constraints(constraints):
-        return constraints[:, :-1], constraints[:, -1]
-
-    def __init__(self, intersecting_constraints, constraints):
-        self.binding_constraints = intersecting_constraints
-        self.coords = self.compute_coords_from_constraints(constraints)
-
-    def get_coords(self):
-        return self.coords
-
-    def get_binding_constraints(self):
-        return self.binding_constraints
-
-    def compute_coords_from_constraints(self, constraints):
-        A, b = Vertex.separate_constraints(constraints)
-        return np.linalg.solve(A[self.get_binding_constraints(), ], b[self.get_binding_constraints(), ])
-
-    def is_feasible(self, constraints):
-        return self.first_invalid_constraint(constraints) >= constraints.shape[0]
-
-    def first_invalid_constraint(self, constraints):
-        A, b = Vertex.separate_constraints(constraints)
-        Ax = np.dot(A, self.get_coords())
-
-        if Ax[0] != b[0]:
-            return 0
-
-        constraints_not_satisfied = Ax[1:] > b[1:]
-        if np.any(constraints_not_satisfied):
-            return 1 + np.argmax(constraints_not_satisfied) # returns first index of invalid constraint
-
-        return constraints.shape[0] # no invalid constraint was found so return index past last constraint
-
-    def __hash__(self):
-        return hash(self.get_binding_constraints())
-
-    def __eq__(self, other):
-        return self.get_binding_constraints() == other.get_binding_constraints()
-
 
 class Auction(object):
     def __init__(self, quota, cost_fns, approx_method = 'least_squares'):
@@ -131,29 +83,43 @@ class Auction(object):
             return CostFn(least_squares_result[0], cost_fn.get_capacity())
 
     def determine_optimal_allocations(self):
-        num_vars = len(self.cost_fns)
-        objective = self.get_objective_fn(self.cost_fns)
-        constraints = self.create_auction_constraints(self.cost_fns, self.quota)
-        
-        possible_binding_sets = it.combinations(range(1, constraints.shape[0]), num_vars - 1)
-        num_vertices = 0
-        min_vertex = None
-        min_value = None
-        for binding_set in possible_binding_sets:
-            full_binding_set = (0,) + binding_set
-            if Vertex.is_valid(full_binding_set, constraints):
-                v = Vertex(full_binding_set, constraints)
-                if v.is_feasible(constraints):
-                    num_vertices += 1
-                    value = objective(v.get_coords())
-                    if min_value is None or value < min_value:
-                        min_vertex = v
-                        min_value = value
+        return self.determine_allocations_with(self.cost_fns)
 
-        if min_vertex is None:
-            return False, np.zeros(num_vars)
+    def determine_approx_allocations(self):
+        return self.determine_allocations_with(self.approx_cost_fns)
 
-        return True, min_vertex.get_coords()
+    def determine_allocations_with(self, cost_fns):
+        # setup model and variables
+        num_bidders = len(cost_fns)
+        model = Model('approx_allocations')
+        alloc_vars = [model.addVar('x_{i}'.format(i=i), lb=0, ub=cost_fns[i].get_capacity()) \
+                        for i in range(num_bidders)]
+        entry_vars = [model.addVar('b_{i}'.format(i=i), vtype='B') for i in range(num_bidders)]
+
+        # setup objective fn
+        costs = [self.create_poly(alloc_vars[i], cost_fns[i].get_coef()[1:]) \
+                    + entry_vars[i]*cost_fns[i].get_coef()[0] \
+                        for i in range(num_bidders)]
+        model.setObjective(quicksum(costs), sense='minimize')
+
+        # setup constraints
+        model.addCons(quicksum(alloc_vars) == self.get_quota()) # quota constraint
+
+        for i in range(num_bidders):
+            model.addCons(alloc_vars[i] <= 9001*cost_fns[i].get_capacity()*entry_vars[i])
+
+        model.hideOutput()
+        model.optimize()
+
+        alloc_var_vals = [model.getVal(var) for var in alloc_vars]
+
+        model.free() # to prevent memory leaks
+
+        # TODO: figure out how to detect solver failure
+        return True, np.array(alloc_var_vals)
+
+    def create_poly(self, var, coef):
+        return quicksum([coef[i]*var**(i + 1) for i in range(len(coef))])
 
     def get_objective_fn(self, cost_fns):
         def objective(x):
@@ -162,38 +128,3 @@ class Auction(object):
             return np.sum(costs, 0)
 
         return objective
-
-    def create_auction_constraints(self, cost_fns, quota):
-        num_vars = len(cost_fns)
-
-        # from top row to bottom: quota constraint, nonnegativity constraints, capacity constraints
-        A = np.concatenate((np.ones(num_vars)[np.newaxis], \
-                        -1 * np.eye(num_vars), \
-                        np.eye(num_vars)))
-
-        # from top row to bottom: quota constraint, nonnegativity constraints, capacity constraints
-        b = np.concatenate((np.array([quota]), \
-                        np.zeros(num_vars), \
-                        np.array([fn.get_capacity() for fn in cost_fns])))
-
-        return np.column_stack((A, b))
-
-    def get_min_vertex_from(self, vertices, objective):
-        vertex_list = list(vertices)
-        vertex_coords = np.array([v.get_coords() for v in vertex_list])
-        return vertex_list[np.argmin(objective(vertex_coords))]
-
-    def determine_approx_allocations(self):
-        num_vars = len(self.approx_cost_fns)
-        objective = self.get_linear_cost_coef(self.approx_cost_fns)
-        constraints = self.create_auction_constraints(self.approx_cost_fns, self.quota)
-
-        A_ub, b_ub = constraints[1:, :-1], constraints[1:, -1]
-        A_eq, b_eq = constraints[0, :-1][np.newaxis], constraints[0, -1]
-        
-        result = linprog(objective, A_ub, b_ub, A_eq, b_eq)
-        return result.success, result.x
-
-    def get_linear_cost_coef(self, cost_fns):
-        coef = np.array([fn.get_coef() for fn in cost_fns])
-        return coef[:,1]
