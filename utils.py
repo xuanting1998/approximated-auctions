@@ -1,4 +1,13 @@
 import numpy as np
+from scipy.special import binom
+
+def create_cost_fn_coef(degree, capacity):
+    coef = (-1)**(degree - 1) * np.vectorize(compute_coef, excluded={0, 1})(degree, capacity, np.arange(degree + 1))
+    coef[0] = abs(coef[0])
+    return coef
+
+def compute_coef(max_deg, cap, deg):
+    return binom(max_deg, deg) * (-1*cap)**(max_deg - deg)
 
 # shamelessly stolen from http://stackoverflow.com/questions/1208118/using-numpy-to-build-an-array-of-all-combinations-of-two-arrays
 def cartesian(arrays, out=None):

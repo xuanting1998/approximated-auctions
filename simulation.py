@@ -1,22 +1,16 @@
 import numpy as np
-from scipy.special import binom
 from auction import CostFn, Auction
-from utils import cartesian
+from utils import create_cost_fn_coef, cartesian
 import sys
 import multiprocessing
 from functools import partial
 import time
 import csv
 
-def compute_coef(max_deg, cap, deg):
-    return binom(max_deg, deg) * (-1*cap)**(max_deg - deg)
-
 def rand_cost_fn(deg_mean, deg_prob, cap_mean, cap_var):
     degree = np.random.binomial(deg_mean / deg_prob, deg_prob)
     capacity = np.random.normal(cap_mean, cap_var)
-    coef = (-1)**(degree - 1) * np.vectorize(compute_coef, excluded={0, 1})(degree, capacity, np.arange(degree + 1))
-    coef[0] = abs(coef[0])
-    return CostFn(coef, capacity)
+    return CostFn(create_cost_fn_coef(degree, capacity), capacity)
 
 def rand_auction(deg_mean, \
                     deg_prob, \

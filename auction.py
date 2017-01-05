@@ -18,7 +18,7 @@ class CostFn(object):
         self.capacity = capacity
 
     def eval(self, values):
-        return np.vectorize(lambda x: self.fn(x) if x > 0 else 0)(values)
+        return np.vectorize(lambda x: self.fn(x) if x > 0 else 0, otypes=[np.float])(values)
 
     def get_capacity(self):
         return self.capacity
@@ -27,7 +27,7 @@ class CostFn(object):
         return self.fn.coef
 
 class Auction(object):
-    def __init__(self, quota, cost_fns, approx_method = 'least_squares'):
+    def __init__(self, quota, cost_fns, approx_method = 'cap_least_squares'):
         self.quota = quota
         self.approx_method = approx_method
 
@@ -75,12 +75,23 @@ class Auction(object):
         return [self.approx_cost_fn(cost_fn) for cost_fn in cost_fns]
 
     def approx_cost_fn(self, cost_fn):
-        if self.approx_method is 'least_squares':
-            raw_x = np.linspace(0, cost_fn.get_capacity(), NUM_APPROX_VALS)
+        if self.approx_method in ['least_squares', 'cap_least_squares']:
+            cap = cost_fn.get_capacity()
+            raw_x = np.linspace(0, cap, NUM_APPROX_VALS)
+            y_at_cap = cost_fn.eval(cap)
             y = cost_fn.eval(raw_x)
             X = np.column_stack((np.ones(raw_x.shape[0]), raw_x))
-            least_squares_result = np.linalg.lstsq(X, y)
-            return CostFn(least_squares_result[0], cost_fn.get_capacity())
+
+            if self.approx_method is 'cap_least_squares':
+                y -= y_at_cap
+                X = (raw_x - cap)[:, None]
+
+            coef = np.linalg.lstsq(X, y)[0]
+
+            if self.approx_method is 'cap_least_squares':
+                coef = np.array([y_at_cap - coef[0]*cap, coef[0]])
+
+            return CostFn(coef, cost_fn.get_capacity())
 
     def determine_optimal_allocations(self):
         return self.determine_allocations_with(self.cost_fns)
@@ -103,14 +114,14 @@ class Auction(object):
         model.setObjective(quicksum(costs), sense='minimize')
 
         # setup constraints
-        model.addCons(quicksum(alloc_vars) == self.get_quota()) # quota constraint
+        model.addCons(quicksum(alloc_vars) == self.get_quota(), name='quota') # quota constraint
 
         for i in range(num_bidders):
-            model.addCons(alloc_vars[i] <= 9001*cost_fns[i].get_capacity()*entry_vars[i])
+            model.addCons(alloc_vars[i] <= 9001*cost_fns[i].get_capacity()*entry_vars[i], name=str(i))
 
         model.hideOutput()
         model.optimize()
-
+        
         alloc_var_vals = [model.getVal(var) for var in alloc_vars]
 
         model.free() # to prevent memory leaks
